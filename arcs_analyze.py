@@ -30,6 +30,100 @@ ACTION_HEX = {
     'Administration': '#C8953A',   # warm gold
 }
 
+# Guild card icon mapping — which resource icon each Guild card provides
+GUILD_CARD_ICONS = {
+    'AdminUnion': None,
+    'ArmsUnion': 'Weapon',
+    'MaterialCartel': 'Material',
+    'MiningInterest': 'Material',
+    'SecretOrder': 'Psionic',
+    'LoyalKeepers': 'Relic',
+    'LoyalPilots': 'Fuel',
+    'SwornGuardians': 'Weapon',
+    'SpacingUnion': 'Fuel',
+    'ConstructionUnion': 'Material',
+    'ElderBroker': 'Psionic',
+    'GalacticBards': 'Psionic',
+    'ShippingInterest': 'Fuel',
+    'LoyalEngineers': 'Material',
+    'LoyalEmpaths': 'Psionic',
+    'Gatekeepers': 'Psionic',
+    'PrisonWardens': 'Weapon',
+    'Farseers': 'Psionic',
+    'LatticeSpies': 'Psionic',
+    'RelicFence': 'Relic',
+    'FuelCartel': 'Fuel',
+    'LoyalMarines': 'Weapon',
+    'SilverTongues': 'Psionic',
+    'CourtEnforcers': 'Weapon',
+    'Skirmishers': 'Weapon',
+    'PopulistDemandsBB': None,
+    'SongOfFreedomBB': None,
+    'CallToActionBB': None,
+    'OutrageSpreadsBB': None,
+}
+
+
+# ── PLAYWRIGHT SCORING EXTRACTION ────────────────────────────────────────────
+
+def extract_scoring_playwright(replay_path):
+    """Use Playwright to render the replay and extract chapter-scoring data."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    scores = []
+    try:
+        abs_path = str(Path(replay_path).resolve())
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.goto(f'file://{abs_path}')
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(10000)
+                page.click('body')
+                for _ in range(80):
+                    page.wait_for_timeout(3000)
+                    body_text = page.inner_text('body')
+                    if 'Game Over' in body_text:
+                        break
+                else:
+                    body_text = page.inner_text('body')
+
+                cur_chapter = None
+                for line in body_text.split('\n'):
+                    line = line.strip()
+                    if 'Chapter' in line and 'had ended' in line:
+                        cm = re.search(r'Chapter (\d+) had ended', line)
+                        if cm:
+                            cur_chapter = int(cm.group(1))
+                    elif cur_chapter and 'scored' in line.lower() and 'place' in line:
+                        scores.append((cur_chapter, line))
+            finally:
+                browser.close()
+    except Exception:
+        return []
+    return scores
+
+
+def parse_scoring_lines(chapter_scores):
+    """Parse chapter-scoring tuples into structured data."""
+    results = []
+    pattern = r'(\w+) scored (first|second) place (\w+) for ⟅(\d+)⟆'
+    for ch, line in chapter_scores:
+        m = re.search(pattern, line)
+        if m:
+            results.append({
+                'chapter': ch,
+                'player': m.group(1),
+                'place': m.group(2),
+                'ambition': m.group(3),
+                'vp': int(m.group(4)),
+            })
+    return results
+
 
 # ── PARSING ──────────────────────────────────────────────────────────────────
 
@@ -64,7 +158,7 @@ def parse_replay_log(content):
 
 # ── ANALYSIS ─────────────────────────────────────────────────────────────────
 
-def analyze_log(lines, players_map):
+def analyze_log(lines, players_map, scoring_data=None):
     plist = list(players_map.keys())
 
     def pp():  # per-player zero dict
@@ -92,6 +186,10 @@ def analyze_log(lines, players_map):
         'rounds_per_chapter': {},
         'resources_gained': {p: defaultdict(int) for p in plist},
         'resources_spent': {p: defaultdict(int) for p in plist},
+        'battle_actions': {p: 0 for p in plist},
+        'guild_cards': {p: set() for p in plist},
+        'guild_card_icons': {p: defaultdict(int) for p in plist},
+        'chapter_resources': defaultdict(lambda: {p: defaultdict(int) for p in plist}),
     }
 
     # Some games (Leaders&Lores) emit no StartChapterAction for ch1 (it starts implicitly
@@ -226,6 +324,8 @@ def analyze_log(lines, players_map):
                 p = fa(am.group(1))
                 if p in s['chapter_actions'][cur_chapter]:
                     s['chapter_actions'][cur_chapter][p][aname] += 1
+                if aname == 'Battle':
+                    s['battle_actions'][p] += 1
 
         # Move: only count Pip-cost legs (NoCost legs are free ability follow-ons)
         mm2 = re.search(r'\bMoveListAction\((\w+),\s*\w+,\s*\w+,\s*\[.*?\],\s*\w+,\s*(Pip)', l)
@@ -266,6 +366,32 @@ def analyze_log(lines, players_map):
                     s['court_cards_by_player'][p].add(card_name)
                     s['court_by_chapter'][cur_chapter][p].append(card_name)
 
+        # ── Guild cards — unique cards per player ──
+        gcm = re.search(r'SecuredLaneAction\((\w+), (\[[^\]]+\])', l)
+        if gcm:
+            p = fa(gcm.group(1))
+            cards_str = gcm.group(2)
+            for gc in re.finditer(r'GuildCard\("(\w+)", (\w+)\)', cards_str):
+                card_id = gc.group(1)
+                card_name = gc.group(2)
+                key = (card_id, p)
+                if key not in seen_secure:
+                    seen_secure.add(key)
+                    if p in s['guild_cards']:
+                        s['guild_cards'][p].add(card_name)
+                        icon = GUILD_CARD_ICONS.get(card_name)
+                        if icon:
+                            s['guild_card_icons'][p][icon] += 1
+
+        # ── Resource holdings snapshots ──
+        rrm = re.search(r'ReorderResourcesAction\((\w+), \[([^\]]*)\]', l)
+        if rrm:
+            p = fa(rrm.group(1))
+            res_str = rrm.group(2)
+            for res in re.findall(r'\|\((\w+)#', res_str):
+                if p in s['chapter_resources'][cur_chapter]:
+                    s['chapter_resources'][cur_chapter][p][res] += 1
+
         prev_line = l
 
     # ── Derived ──
@@ -276,6 +402,96 @@ def analyze_log(lines, players_map):
         s[f'pip_high_{p}'] = sum(1 for x in pips if x >= 3)
         s[f'pip_low_{p}'] = sum(1 for x in pips if x <= 2)
         s[f'prelude_total_{p}'] = sum(s['prelude_pips'][p])
+
+   # ── Build scoring lookup from Playwright data ──
+    # Scoring data has color names (Blue, Red, White, Yellow)
+    # Need to map to abbreviations (B, R, W, Y)
+    scoring_lookup = {}
+    if scoring_data:
+        for sd in scoring_data:
+            color_abbr = FULL_TO_ABBREV.get(sd['player'], sd['player'][0].upper())
+            key = (sd['chapter'], color_abbr, sd['ambition'])
+            scoring_lookup[key] = sd
+
+    # ── Ambition evaluation (competitive ranking) ──
+    # Two-pass snipe detection: track both "did I snipe someone" and "did someone snipe me"
+    decls_by_amb = defaultdict(list)
+    for decl in s['ambition_declarations']:
+        decls_by_amb[decl['ambition']].append(decl)
+
+    for amb, decl_list in decls_by_amb.items():
+        for i, decl in enumerate(decl_list):
+            p = decl['player']
+            prev = decl_list[i - 1] if i > 0 else None
+            nxt  = decl_list[i + 1] if i < len(decl_list) - 1 else None
+            # This player re-declared over someone else
+            decl['is_sniper']        = prev is not None and prev['player'] != p
+            decl['sniped_from']      = prev['player'] if decl['is_sniper'] else None
+            # A different player later re-declared over this player
+            decl['got_sniped']       = nxt is not None and nxt['player'] != p
+            decl['sniped_by']        = nxt['player'] if decl['got_sniped'] else None
+
+    # Score each declared ambition per chapter
+    for decl in s['ambition_declarations']:
+        amb = decl['ambition']
+        p = decl['player']
+        ch = decl['chapter']
+        decl['ch_score'] = {}
+        decl['ch_rank'] = {}
+        decl['ch_vp'] = {}
+
+        for c in range(1, s['num_chapters'] + 1):
+            key = (c, p, amb)
+            if key in scoring_lookup:
+                sd = scoring_lookup[key]
+                decl['ch_vp'][c] = sd['vp']
+                decl['ch_rank'][c] = {p: sd['place']}
+                # Build full ranking for this chapter from scoring data
+                ch_players = {pl: 0 for pl in plist}
+                for s2 in scoring_data:
+                    if s2['chapter'] == c and s2['ambition'] == amb:
+                        ch_players[s2['player']] = s2['vp']
+                decl['ch_score'][c] = ch_players
+            else:
+                # No scoring data for this chapter/ambition/player
+                decl['ch_vp'][c] = None
+                decl['ch_score'][c] = {pl: None for pl in plist}
+                decl['ch_rank'][c] = {pl: None for pl in plist}
+
+        # Determine overall status
+        player_ch_ranks = [decl['ch_rank'].get(c, {}).get(p) for c in range(1, s['num_chapters'] + 1)]
+        player_ch_vps = [decl.get('ch_vp', {}).get(c) for c in range(1, s['num_chapters'] + 1)]
+
+        has_won = any(r == 'first' for r in player_ch_ranks)
+        has_second = any(r == 'second' for r in player_ch_ranks)
+        has_data = any(r is not None for r in player_ch_ranks)
+
+        if has_won:
+            decl['status'] = 'Won'
+        elif has_second:
+            decl['status'] = '2nd'
+        elif has_data:
+            decl['status'] = 'Missing'
+        else:
+            decl['status'] = 'Missing'
+
+        # Check if any chapter has actual ranking data (not NoData or None)
+        has_ranking = any(r in ('first', 'second') for r in player_ch_ranks)
+        has_no_data = any(r == 'NoData' for r in player_ch_ranks)
+
+        if has_no_data:
+            # Tyrant/Warlord: data not available
+            decl['status'] = 'NoData'
+            decl['reason'] = 'Captives/Trophies not tracked in replay'
+        elif any(r == 'first' for r in player_ch_ranks):
+            decl['status'] = 'Won'
+            decl['first_chapters'] = [c+1 for c, r in enumerate(player_ch_ranks) if r == 'first']
+        elif any(r == 'second' for r in player_ch_ranks):
+            decl['status'] = '2nd'
+            decl['second_chapters'] = [c+1 for c, r in enumerate(player_ch_ranks) if r == 'second']
+        else:
+            decl['status'] = 'Missing'
+            decl['reason'] = 'Never placed in top 2'
 
     return s
 
@@ -457,20 +673,55 @@ def generate_html(s, source_filename):
         })
 
     # Ambition timeline entries
+    STATUS_ICONS = {'Won': '✓', 'Missing': '✗', 'Sniped': '⚡', '2nd': '🥈', 'NoData': '?'}
+    STATUS_COLORS = {'Won': '#22C55E', 'Missing': '#EF4444', 'Sniped': '#F59E0B', '2nd': '#60A5FA', 'NoData': '#6B7280'}
     ambition_timeline = []
     for decl in s['ambition_declarations']:
         pname = player_name(s, decl['player'])
         px = player_hex(decl['player'])
         ax = AMBITION_HEX.get(decl['ambition'], '#888')
         vox = ' (via Vox)' if decl['via_vox'] else ''
+        status = decl['status']
+        sc = STATUS_COLORS.get(status, '#888')
+        si = STATUS_ICONS.get(status, '?')
+        # Build VP/placement inline — only for the declaration chapter
+        c = decl['chapter']
+        vp = decl.get('ch_vp', {}).get(c)
+        rank = decl['ch_rank'].get(c, {}).get(decl['player'])
+        if vp is not None and rank:
+            vp_str = f'<span style="color:#FBBF24;font-size:0.72rem">Ch{c}: {vp}VP</span> <span style="color:#60A5FA;font-size:0.72rem">({rank})</span>'
+        elif rank:
+            vp_str = f'<span style="color:#4B5563;font-size:0.72rem">Ch{c}: —</span> <span style="color:#4B5563;font-size:0.72rem">({rank})</span>'
+        else:
+            vp_str = f'<span style="color:#4B5563;font-size:0.72rem">Ch{c}: ?</span>'
+
+        # Build scoring results — 1st/2nd place with VP, sorted first before second
+        scoring_entries = []
+        for key, sd in s.get('scoring_lookup', {}).items():
+            if key[0] == c and key[2] == decl['ambition']:
+                scoring_entries.append(sd)
+        scoring_entries.sort(key=lambda x: 0 if x['place'] == 'first' else 1)
+        result_parts = []
+        for sd in scoring_entries:
+            wabbr = FULL_TO_ABBREV.get(sd['player'], sd['player'][0].upper())
+            wname = player_name(s, wabbr)
+            whex  = player_hex(wabbr)
+            medal = '🥇' if sd['place'] == 'first' else '🥈'
+            result_parts.append(f'<span style="color:{whex};font-weight:700">{medal} {wname} {sd["vp"]}VP</span>')
+        results_str = ' <span style="color:#475569"> · </span> '.join(result_parts) if result_parts else '<span style="color:#4B5563">no scoring data</span>'
+        vox_str = f'<span style="color:#64748B;font-size:0.7rem">via Vox</span>' if decl['via_vox'] else ''
         ambition_timeline.append(
             f'<div class="timeline-entry" style="border-left:3px solid {ax}">'
             f'<span class="tl-chapter">Ch {decl["chapter"]}</span>'
             f'<span class="tl-player" style="color:{px}">{pname}</span>'
             f'<span class="tl-ambition" style="color:{ax}">{decl["ambition"]}</span>'
-            f'<span class="tl-note">{vox}</span>'
+            f'<span class="tl-results">{results_str}</span>'
+            f'{(" " + vox_str) if vox_str else ""}'
             f'</div>'
         )
+
+     # Ambitions won — status tracking
+    STATUS_COLORS = {'Won': '#22C55E', 'Missing': '#EF4444', 'Sniped': '#F59E0B', '2nd': '#60A5FA', 'NoData': '#6B7280'}
 
     # Resource economy datasets
     res_colors = [RESOURCE_HEX[r] for r in ALL_RESOURCES]
@@ -663,13 +914,13 @@ def generate_html(s, source_filename):
                overflow-y: auto; padding-right: 4px; }}
   .timeline::-webkit-scrollbar {{ width: 4px; }}
   .timeline::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 2px; }}
-  .timeline-entry {{ display: flex; align-items: center; gap: 10px; padding: 8px 12px;
-                      background: var(--surface2); border-radius: 8px; font-size: 0.82rem; }}
+  .timeline-entry {{ display: flex; align-items: center; gap: 12px; padding: 7px 12px;
+                      background: var(--surface2); border-radius: 8px; font-size: 0.82rem; flex-wrap: wrap; }}
   .tl-chapter {{ color: var(--muted); font-size: 0.72rem; font-weight: 700;
-                  text-transform: uppercase; min-width: 34px; }}
-  .tl-player {{ font-weight: 700; min-width: 70px; }}
-  .tl-ambition {{ font-weight: 800; min-width: 70px; }}
-  .tl-note {{ color: var(--muted); font-size: 0.75rem; }}
+                  text-transform: uppercase; min-width: 32px; flex-shrink: 0; }}
+  .tl-player {{ font-weight: 700; min-width: 66px; flex-shrink: 0; }}
+  .tl-ambition {{ font-weight: 800; min-width: 66px; flex-shrink: 0; }}
+  .tl-results {{ flex: 1; font-size: 0.8rem; }}
 
   /* Court cards */
   .court-player {{ margin-bottom: 14px; }}
@@ -688,10 +939,20 @@ def generate_html(s, source_filename):
   .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }}
   .stat-item {{ background: var(--surface2); border-radius: 8px; padding: 12px 14px; }}
   .stat-val {{ font-size: 1.6rem; font-weight: 900; line-height: 1; }}
-  .stat-lbl {{ font-size: 0.7rem; color: var(--muted); margin-top: 4px; font-weight: 600;
-                text-transform: uppercase; letter-spacing: 0.5px; }}
+   .stat-lbl {{ font-size: 0.7rem; color: var(--muted); margin-top: 4px; font-weight: 600;
+                 text-transform: uppercase; letter-spacing: 0.5px; }}
 
-  footer {{ padding: 24px 40px; color: var(--muted); font-size: 0.75rem; border-top: 1px solid var(--border); }}
+   /* Ambition result cards */
+   .ambition-result {{ background: var(--surface2); border-radius: 8px; padding: 10px 14px;
+                        font-size: 0.82rem; }}
+   .ar-header {{ display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap; }}
+   .ar-player {{ font-weight: 800; }}
+   .ar-ambition {{ font-weight: 700; }}
+   .ar-status {{ font-weight: 800; font-size: 0.78rem; margin-left: auto; }}
+   .ar-ch-breakdown {{ font-size: 0.75rem; margin-bottom: 2px; letter-spacing: 0.5px; }}
+   .ar-meta {{ font-size: 0.72rem; color: var(--muted); }}
+
+   footer {{ padding: 24px 40px; color: var(--muted); font-size: 0.75rem; border-top: 1px solid var(--border); }}
 
   @media (max-width: 900px) {{
     .main, header, footer {{ padding-left: 16px; padding-right: 16px; }}
@@ -900,6 +1161,7 @@ def generate_html(s, source_filename):
     </div>
 
   </div>
+
 
 </div><!-- /main -->
 
@@ -1192,7 +1454,19 @@ def main():
     print(f"Players: {players_map}")
     print(f"Analyzing {len(lines)} log lines...")
 
-    stats = analyze_log(lines, players_map)
+    print("Extracting scoring data via Playwright...")
+    scoring_lines = extract_scoring_playwright(str(src))
+    print(f"  Found {len(scoring_lines)} scoring lines")
+    scoring_data = parse_scoring_lines(scoring_lines)
+
+    stats = analyze_log(lines, players_map, scoring_data=scoring_data)
+    # Build scoring lookup for HTML generation
+    scoring_lookup = {}
+    for sd in scoring_data:
+        color_abbr = FULL_TO_ABBREV.get(sd['player'], sd['player'][0].upper())
+        key = (sd['chapter'], color_abbr, sd['ambition'])
+        scoring_lookup[key] = sd
+    stats['scoring_lookup'] = scoring_lookup
     stats['title'] = lobby.get('title', 'Arcs Game')
     stats['version'] = lobby.get('version', '?')
     stats['options'] = lobby.get('options', [])
