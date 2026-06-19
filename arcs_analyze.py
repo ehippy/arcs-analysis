@@ -190,6 +190,9 @@ def analyze_log(lines, players_map, scoring_data=None):
         'guild_cards': {p: set() for p in plist},
         'guild_card_icons': {p: defaultdict(int) for p in plist},
         'chapter_resources': defaultdict(lambda: {p: defaultdict(int) for p in plist}),
+        'chapter_deals': {},      # chapter -> {abbrev: [(suit, num, pips), ...]}
+        'deal_order': [],         # color list from PlayOrderAction
+        'chapter_court_cards': {}, # chapter -> [(suit, num, pips), ...] leftover/court
     }
 
     # Some games (Leaders&Lores) emit no StartChapterAction for ch1 (it starts implicitly
@@ -204,6 +207,25 @@ def analyze_log(lines, players_map, scoring_data=None):
     seen_secure = set()
 
     for l in lines:
+        # ── Play order (deal order) ──
+        pom = re.match(r'PlayOrderAction\(\[([^\]]+)\]\)', l)
+        if pom:
+            s['deal_order'] = [c.strip() for c in pom.group(1).split(',')]
+
+        # ── Dealt hands (block deal: player i gets positions i*6..(i+1)*6) ──
+        dm = re.match(r'ShuffledDeckCardsAction\(\[(.+)\]\)', l)
+        if dm and cur_chapter > 0:
+            raw_cards = re.findall(r'ActionCard\((\w+),\s*(\d+),\s*(\d+)\)', dm.group(1))
+            full_deck  = [(suit, int(num), int(pips)) for suit, num, pips in raw_cards]
+            po = s['deal_order']
+            n  = len(po)
+            hands = {}
+            for pi, color in enumerate(po):
+                abbr = fa(color)
+                hands[abbr] = full_deck[pi*6:(pi+1)*6]
+            s['chapter_deals'][cur_chapter] = hands
+            s['chapter_court_cards'][cur_chapter] = full_deck[n*6:]
+
         # ── Chapter / round structure ──
         if l == 'StartChapterAction':
             cur_chapter += 1
@@ -734,6 +756,92 @@ def generate_html(s, source_filename):
             res_gained_datasets.append({'label': res, 'data': gained_vals, 'backgroundColor': res_colors[i]})
             res_spent_datasets.append({'label': res, 'data': spent_vals,  'backgroundColor': res_colors[i]})
 
+    # Deal luck — per-chapter starting hands
+    SUIT_HEX = {'Administration': '#C8953A', 'Aggression': '#B82020',
+                'Construction': '#D85020', 'Mobilization': '#308090'}
+    SUIT_ABB  = {'Administration': 'Adm', 'Aggression': 'Agg',
+                 'Construction': 'Con', 'Mobilization': 'Mob'}
+    AMBITION_NAMES = {2: 'Tycoon', 3: 'Tyrant', 4: 'Warlord', 5: 'Keeper', 6: 'Empath'}
+
+    deal_luck_rows = []
+    for ch in sorted(s['chapter_deals'].keys()):
+        hands = s['chapter_deals'][ch]
+        court = s['chapter_court_cards'].get(ch, [])
+        row_cells = [f'<td class="deal-ch">Ch {ch}</td>']
+        for p in plist:
+            hand = hands.get(p, [])
+            total_pips = sum(pip for _, _, pip in hand)
+            sixes = sum(1 for _, num, _ in hand if num == 6)
+            twos  = sum(1 for _, num, _ in hand if num == 2)
+            if total_pips >= 18:
+                qual_cls, qual_tip = 'deal-rich', f'{total_pips}pip'
+            elif total_pips <= 12:
+                qual_cls, qual_tip = 'deal-poor', f'{total_pips}pip'
+            else:
+                qual_cls, qual_tip = 'deal-mid', f'{total_pips}pip'
+
+            card_spans = []
+            for suit, num, pips in hand:
+                sh = SUIT_HEX.get(suit, '#888')
+                sa = SUIT_ABB.get(suit, suit[:3])
+                amb = AMBITION_NAMES.get(num, '?')[:4]
+                extra = ''
+                if num == 6:
+                    extra = ' deal-six'
+                elif num == 2:
+                    extra = ' deal-two'
+                card_spans.append(
+                    f'<span class="deal-card{extra}" style="border-color:{sh}" title="{suit} {num} ({pips}pip / {amb})">'
+                    f'<span style="color:{sh}">{sa}{num}</span>'
+                    f'<span class="deal-pip">{pips}p</span></span>'
+                )
+            note = ''
+            if sixes >= 3:
+                note = f'<span class="deal-note deal-note-bad">⚠ {sixes}×6</span>'
+            elif twos >= 3:
+                note = f'<span class="deal-note deal-note-good">★ {twos}×2</span>'
+            row_cells.append(
+                f'<td class="deal-player-cell"><div class="deal-player-header">'
+                f'<span class="{qual_cls}">{qual_tip}</span>{note}</div>'
+                f'<div class="deal-cards">{"".join(card_spans)}</div></td>'
+            )
+        # Court cards (leftover)
+        if court:
+            court_spans = []
+            for suit, num, pips in court:
+                sh = SUIT_HEX.get(suit, '#888')
+                sa = SUIT_ABB.get(suit, suit[:3])
+                amb = AMBITION_NAMES.get(num, '?')[:4]
+                court_spans.append(
+                    f'<span class="deal-card deal-court" style="border-color:{sh}">'
+                    f'<span style="color:{sh}">{sa}{num}</span>'
+                    f'<span class="deal-pip">{pips}p</span></span>'
+                )
+            row_cells.append(f'<td class="deal-player-cell"><div class="deal-cards">{"".join(court_spans)}</div></td>')
+        else:
+            row_cells.append('<td></td>')
+        deal_luck_rows.append(f'<tr>{"".join(row_cells)}</tr>')
+
+    deal_luck_header = '<tr><th>Chapter</th>' + ''.join(
+        f'<th style="color:{player_hex(p)}">{player_name(s,p)}</th>' for p in plist
+    ) + '<th class="deal-court-hdr">Court</th></tr>'
+
+    deal_luck_html = f'''
+    <div class="card">
+      <h2>Deal Luck — Starting Hands by Chapter</h2>
+      <p class="deal-legend"><span class="deal-rich">18+pip = pip-rich</span>
+        · <span class="deal-poor">≤12pip = pip-poor</span>
+        · <span class="deal-note deal-note-bad">⚠ lots of 6s</span>
+        · <span class="deal-note deal-note-good">★ lots of 2s</span>
+        · <span class="deal-court deal-card" style="border-color:#555">court = available to acquire</span></p>
+      <div class="table-wrap">
+        <table class="deal-table">
+          <thead>{deal_luck_header}</thead>
+          <tbody>{"".join(deal_luck_rows)}</tbody>
+        </table>
+      </div>
+    </div>''' if deal_luck_rows else ''
+
     # Court cards detail per player
     court_detail_html = []
     for p in plist:
@@ -929,6 +1037,29 @@ def generate_html(s, source_filename):
   .card-pill {{ background: var(--surface2); border: 1px solid var(--border);
                 border-radius: 20px; padding: 3px 10px; font-size: 0.72rem; color: var(--muted); }}
 
+  /* Deal luck table */
+  .deal-table {{ width: 100%; border-collapse: collapse; }}
+  .deal-table th, .deal-table td {{ padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }}
+  .deal-table th {{ font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }}
+  .deal-ch {{ color: var(--muted); font-size: 0.75rem; font-weight: 700; white-space: nowrap; }}
+  .deal-player-cell {{ min-width: 200px; }}
+  .deal-player-header {{ display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 0.72rem; }}
+  .deal-cards {{ display: flex; flex-wrap: wrap; gap: 4px; }}
+  .deal-card {{ display: inline-flex; align-items: center; gap: 3px; background: var(--surface2);
+                border: 1px solid; border-radius: 5px; padding: 2px 6px; font-size: 0.72rem; font-weight: 600; }}
+  .deal-pip {{ color: var(--muted); font-weight: 400; font-size: 0.65rem; }}
+  .deal-six {{ opacity: 0.55; }}
+  .deal-two {{ outline: 1px solid #F59E0B33; }}
+  .deal-court {{ opacity: 0.45; border-style: dashed !important; }}
+  .deal-court-hdr {{ color: var(--muted); font-size: 0.7rem; }}
+  .deal-rich {{ color: #22C55E; font-weight: 700; }}
+  .deal-poor {{ color: #EF4444; font-weight: 700; }}
+  .deal-mid  {{ color: var(--muted); }}
+  .deal-note {{ font-size: 0.65rem; font-weight: 700; padding: 1px 5px; border-radius: 4px; }}
+  .deal-note-bad  {{ background: #EF444420; color: #EF4444; }}
+  .deal-note-good {{ background: #F59E0B20; color: #F59E0B; }}
+  .deal-legend {{ font-size: 0.72rem; color: var(--muted); margin: 0 0 14px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }}
+
   /* Section divider */
   .section-label {{ font-size: 0.7rem; font-weight: 700; text-transform: uppercase;
                      letter-spacing: 1.2px; color: var(--muted); margin: 32px 0 14px;
@@ -1115,6 +1246,9 @@ def generate_html(s, source_filename):
     </div>
 
   </div>
+
+  <!-- ── DEAL LUCK ── -->
+  {deal_luck_html}
 
   <!-- ── COURT DETAIL ── -->
   <div class="card" style="margin-top:20px">
