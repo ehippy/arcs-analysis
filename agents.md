@@ -90,13 +90,13 @@ StartChapterAction                               — next chapter begins (increm
 The deck in `ShuffledDeckCardsAction` is dealt in **block order**: player 1 gets positions 1–6, player 2 gets 7–12, player 3 gets 13–18. The 2 remaining cards (19–20) become **court cards** — available for mid-chapter acquisition. `PlayOrderAction([Blue, White, Red])` establishes the deal order (appears once at game start, doesn't change).
 
 Block deal is correct for initial hands. Players may acquire additional cards via:
-- **`ReserveCardAction`** — guild card prelude ability (Union cards: AdminUnion, ArmsUnion, SpacingUnion, ConstructionUnion each let you recover/grab an action card of their suit during prelude)
+- **`ReserveCardAction`** — guild card prelude ability (Union cards: AdminUnion, ArmsUnion, SpacingUnion, ConstructionUnion each let you recover/grab an action card of their suit during prelude). **These are single-use, not repeatable.** Verified against logs: each Union card instance triggers `ReserveCardAction` exactly once across the whole game, never twice for the same card id (e.g. `bc11`). It is NOT a standing engine that produces a bonus card every prelude you hold it — it's a one-shot card, spent once then presumably discarded. Don't write analysis copy implying a player "ran an engine all chapter" off a Union card; it bought them exactly one extra card, used at a moment of their choosing.
 - **Vox cards** (e.g., `CallToActionBB`) — can grant extra action cards mid-chapter
 - **Court card acquisition** — taking leftover cards from the board
 
 ### Guild cards vs Influence
 - **`InfluenceAction`** = main-phase action, spends pips to place influence and potentially gain court/guild cards from the board
-- **`ReserveCardAction`** = prelude-phase ability triggered by a guild card (specifically Union cards), gives an extra action card. NOT the same as Influence.
+- **`ReserveCardAction`** = prelude-phase ability triggered by a guild card (specifically Union cards), gives **one** extra action card, one time only. NOT the same as Influence, and NOT a repeating bonus.
 
 ### Prelude phase
 After winning a trick (or seizing), the leader gets a prelude before their main action:
@@ -208,8 +208,8 @@ ACTION_HEX   = {'Aggression': '#B82020', 'Mobilization': '#308090',
 - **Low pip hand ≠ bad chapter.** A player copying/pivoting most tricks doesn't benefit from high pip cards. Pip count is luck signal, not destiny.
 - **Seizing is almost always right on a copy/pivot turn.** You're burning a 1-pip turn for initiative — nearly always a good trade.
 - **Post-seize lead behavior matters.** Does the player declare ambition immediately? Play a high card to retain initiative? Geekus tends to play high cards (4.7 avg) to retain; Schvimvs declares ambition on ~62% of post-seize leads.
-- **Union guild cards are a force multiplier.** Having AdminUnion/ArmsUnion/etc. effectively extends your hand by 1 card per chapter. Raiding to steal an opponent's Union card is doubly impactful (you gain, they lose).
-- **End-of-chapter solo turns** (when others run out of cards) are free actions — full pip collection, main actions, zero opposition. Vox + Union cards can create a 3-card surplus that extends past opponents' hands.
+- **Union guild cards are a single-shot bonus, not an engine.** Having AdminUnion/ArmsUnion/etc. is worth exactly one extra reserved card, used once, ever — not a repeating bonus every prelude. Raiding to steal an opponent's unused Union card is still doubly impactful (you deny their one shot and gain it for yourself), but don't describe it as extending their hand "every chapter" or "every prelude."
+- **End-of-chapter solo turns** (when others run out of cards) are free actions — full pip collection, main actions, zero opposition. A surplus of a few extra cards (from Vox, a one-shot Union reserve, etc.) can be enough to outlast opponents' hands and create these solo turns.
 - **Court cards in positions 19–20** are available for acquisition mid-chapter, not just from the initial deal.
 
 ---
