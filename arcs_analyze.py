@@ -262,7 +262,7 @@ def analyze_log(lines, players_map, scoring_data=None):
         for role, pip_scale in [('LeadAction', 'full'), ('SurpassAction', 'full'),
                                   ('SeizeAction', 'full'), ('CopyAction', 'one'),
                                   ('PivotAction', 'one')]:
-            cm = re.match(role + r'\(\w+,\s*ActionCard\([^,]+,\s*(\d+)', l)
+            cm = re.match(role + r'\(\w+,\s*ActionCard\([^,]+,\s*\d+,\s*(\d+)', l)
             if cm:
                 pip_val = int(cm.group(1)) if pip_scale == 'full' else 1
                 pm2 = re.match(role + r'\((\w+)', l)
