@@ -662,22 +662,6 @@ def generate_html(s, source_filename):
             'fill': False,
         })
 
-    # Action types — horizontal stacked % bar (one bar per player, segments = action types)
-    action_types_list = ['Construction', 'Mobilization', 'Aggression', 'Administration']
-    act_type_colors = [ACTION_HEX['Construction'], ACTION_HEX['Mobilization'],
-                       ACTION_HEX['Aggression'], ACTION_HEX['Administration']]
-    # Compute % of each player's turns spent on each action type
-    act_type_totals = {p: max(1, sum(s['action_types'][p].get(at, 0) for at in action_types_list))
-                       for p in plist}
-    act_type_datasets = []
-    for i, at in enumerate(action_types_list):
-        act_type_datasets.append({
-            'label': at,
-            'data': [round(100 * s['action_types'][p].get(at, 0) / act_type_totals[p], 1)
-                     for p in plist],
-            'backgroundColor': act_type_colors[i],
-        })
-
     # Buildings total — grouped bar
     btypes = ['City', 'Starport', 'Ship']
     bcolors = ['#10B981', '#3B82F6', '#8B5CF6']
@@ -710,15 +694,6 @@ def generate_html(s, source_filename):
             'backgroundColor': ALL_COLORS[i],
         })
 
-    # Per-player chapter timeline datasets (one chart per player)
-    def player_chapter_datasets(p):
-        ds = []
-        for i, aname in enumerate(ALL_ACTS):
-            vals = [s['chapter_actions'].get(c, {}).get(p, {}).get(aname, 0) for c in chapters]
-            if any(v > 0 for v in vals):   # skip zero-rows
-                ds.append({'label': aname, 'data': vals, 'backgroundColor': ALL_COLORS[i]})
-        return ds
-
     # Combined grouped-stacked chart: one stack per player, segments = action types.
     # Legend labels only emitted for the first player to avoid duplicates.
     # borderColor carries the player hex so the stackBorder plugin can draw one
@@ -747,19 +722,6 @@ def generate_html(s, source_filename):
         f'<span style="color:{phexes[i]};font-size:0.82rem">{player_name(s, p)}</span></span>'
         for i, p in enumerate(plist)
     )
-
-    # Court cards
-    court_counts = [len(s['court_cards_by_player'].get(p, set())) for p in plist]
-
-    # Ambitions summary
-    all_ambitions = ['Tycoon', 'Tyrant', 'Warlord', 'Keeper', 'Empath']
-    ambition_datasets = []
-    for amb in all_ambitions:
-        ambition_datasets.append({
-            'label': amb,
-            'data': [s['ambitions_by_player'][p].get(amb, 0) for p in plist],
-            'backgroundColor': AMBITION_HEX.get(amb, '#888'),
-        })
 
     # Ambition timeline entries
     STATUS_ICONS = {'Won': '✓', 'Missing': '✗', 'Sniped': '⚡', '2nd': '🥈', 'NoData': '?'}
@@ -1050,17 +1012,6 @@ def generate_html(s, source_filename):
             )
         return ''.join(rows)
 
-    player_grid_class = 'grid-3' if len(plist) == 3 else 'grid-2'
-
-    def player_chart_card(p, chart_id):
-        px = player_hex(p)
-        return (
-            f'<div class="card">'
-            f'<h2 style="color:{px}">{player_name(s,p)}</h2>'
-            f'<div class="chart-wrap tall"><canvas id="{chart_id}"></canvas></div>'
-            f'</div>'
-        )
-
     html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1292,35 +1243,16 @@ def generate_html(s, source_filename):
 
   <!-- ── ACTION TYPES ── -->
   <div class="section-label">Action Types & Activities</div>
-  <div class="grid-2">
 
-    <div class="card">
-      <h2>Action Type Mix (% of turns)</h2>
-      <div class="chart-wrap tall">
-        <canvas id="chartActTypes"></canvas>
-      </div>
+  <div class="card">
+    <h2>Actions per Chapter — All Players</h2>
+    <p style="color:var(--muted);font-size:0.82rem;margin:0 0 10px">
+      Groups = chapters &nbsp;·&nbsp; Stacks = players &nbsp;·&nbsp; Segments = action types
+    </p>
+    <div style="margin-bottom:10px">{combined_player_legend}</div>
+    <div class="chart-wrap tall">
+      <canvas id="chartCombined"></canvas>
     </div>
-
-    <div class="card">
-      <h2>Actions per Chapter — All Players</h2>
-      <p style="color:var(--muted);font-size:0.82rem;margin:0 0 10px">
-        Groups = chapters &nbsp;·&nbsp; Stacks = players &nbsp;·&nbsp; Segments = action types
-      </p>
-      <div style="margin-bottom:10px">{combined_player_legend}</div>
-      <div class="chart-wrap tall">
-        <canvas id="chartCombined"></canvas>
-      </div>
-    </div>
-
-  </div>
-
-  <!-- ── DETAILED ACTION TIMELINE ── -->
-  <div class="section-label">Action Timeline by Player</div>
-  <p style="color:var(--muted);font-size:0.82rem;margin-bottom:16px">
-    Each bar is one chapter. Stacked segments show action type mix within that chapter.
-  </p>
-  <div class="{player_grid_class}">
-    {"".join(player_chart_card(p, f'chartPlayer{p}') for p in plist)}
   </div>
 
   <!-- Action totals table -->
@@ -1344,22 +1276,11 @@ def generate_html(s, source_filename):
 
   <!-- ── BUILDINGS ── -->
   <div class="section-label">Infrastructure</div>
-  <div class="grid-2">
-
-    <div class="card">
-      <h2>Buildings Built</h2>
-      <div class="chart-wrap">
-        <canvas id="chartBuildings"></canvas>
-      </div>
+  <div class="card">
+    <h2>Buildings Built</h2>
+    <div class="chart-wrap">
+      <canvas id="chartBuildings"></canvas>
     </div>
-
-    <div class="card">
-      <h2>Court Cards Secured</h2>
-      <div class="chart-wrap">
-        <canvas id="chartCourt"></canvas>
-      </div>
-    </div>
-
   </div>
 
   <!-- ── DEAL LUCK ── -->
@@ -1396,22 +1317,11 @@ def generate_html(s, source_filename):
 
   <!-- ── AMBITIONS ── -->
   <div class="section-label">Ambitions</div>
-  <div class="grid-2">
-
-    <div class="card">
-      <h2>Ambitions Declared</h2>
-      <div class="chart-wrap">
-        <canvas id="chartAmbitions"></canvas>
-      </div>
+  <div class="card">
+    <h2>Declaration Timeline</h2>
+    <div class="timeline">
+      {"".join(ambition_timeline)}
     </div>
-
-    <div class="card">
-      <h2>Declaration Timeline</h2>
-      <div class="timeline">
-        {"".join(ambition_timeline)}
-      </div>
-    </div>
-
   </div>
 
 
@@ -1496,36 +1406,6 @@ new Chart(document.getElementById('chartPipLine'), {{
   }},
 }});
 
-// ── Action type mix — horizontal stacked % bar ──
-new Chart(document.getElementById('chartActTypes'), {{
-  type: 'bar',
-  data: {{
-    labels: pnames,
-    datasets: {jc(act_type_datasets)},
-  }},
-  options: {{
-    responsive: true, maintainAspectRatio: true,
-    indexAxis: 'y',
-    plugins: {{
-      legend: {{ position: 'bottom', labels: {{ boxWidth: 12, padding: 10 }} }},
-      tooltip: {{
-        callbacks: {{
-          label: ctx => ` ${{ctx.dataset.label}}: ${{ctx.parsed.x}}%`,
-        }},
-      }},
-    }},
-    scales: {{
-      x: {{
-        stacked: true,
-        max: 100,
-        grid: {{ color: '#334155' }},
-        ticks: {{ callback: v => v + '%' }},
-      }},
-      y: {{ stacked: true, grid: {{ display: false }} }},
-    }},
-  }},
-}});
-
 // ── Combined grouped-stacked actions per chapter ──
 // Plugin draws one border rect around each complete player stack
 const stackBorderPlugin = {{
@@ -1587,23 +1467,6 @@ new Chart(document.getElementById('chartCombined'), {{
   plugins: [stackBorderPlugin],
 }});
 
-// ── Per-player chapter timelines ──
-{chr(10).join(
-    f"""new Chart(document.getElementById('chartPlayer{p}'), {{
-  type: 'bar',
-  data: {{ labels: {jc(chapter_labels)}, datasets: {jc(player_chapter_datasets(p))} }},
-  options: {{
-    responsive: true, maintainAspectRatio: true,
-    plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 10, padding: 8, font: {{ size: 11 }} }} }} }},
-    scales: {{
-      x: {{ stacked: true, grid: {{ display: false }} }},
-      y: {{ stacked: true, grid: {{ color: '#334155' }}, beginAtZero: true }},
-    }},
-  }},
-}});"""
-    for p in plist
-)}
-
 // ── Buildings ──
 new Chart(document.getElementById('chartBuildings'), {{
   type: 'bar',
@@ -1614,24 +1477,6 @@ new Chart(document.getElementById('chartBuildings'), {{
     scales: {{
       x: {{ grid: {{ display: false }} }},
       y: {{ grid: {{ color: '#334155' }}, ticks: {{ stepSize: 1 }} }},
-    }},
-  }},
-}});
-
-// ── Court cards ──
-new Chart(document.getElementById('chartCourt'), {{
-  type: 'bar',
-  data: {{
-    labels: pnames,
-    datasets: [{{ label: 'Unique court cards', data: {jc(court_counts)}, backgroundColor: phexes }}],
-  }},
-  options: {{
-    responsive: true, maintainAspectRatio: true,
-    indexAxis: 'y',
-    plugins: {{ legend: {{ display: false }} }},
-    scales: {{
-      x: {{ grid: {{ color: '#334155' }}, ticks: {{ stepSize: 1 }} }},
-      y: {{ grid: {{ display: false }} }},
     }},
   }},
 }});
@@ -1654,20 +1499,6 @@ new Chart(document.getElementById('chartResSpent'), {{
   type: 'bar',
   data: {{ labels: pnames, datasets: {jc(res_spent_datasets)} }},
   options: resOpts,
-}});
-
-// ── Ambitions ──
-new Chart(document.getElementById('chartAmbitions'), {{
-  type: 'bar',
-  data: {{ labels: pnames, datasets: {jc(ambition_datasets)} }},
-  options: {{
-    responsive: true, maintainAspectRatio: true,
-    plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12, padding: 10 }} }} }},
-    scales: {{
-      x: {{ stacked: true, grid: {{ display: false }} }},
-      y: {{ stacked: true, grid: {{ color: '#334155' }}, ticks: {{ stepSize: 1 }} }},
-    }},
-  }},
 }});
 
 </script>
