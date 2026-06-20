@@ -193,6 +193,15 @@ def analyze_log(lines, players_map, scoring_data=None):
         'chapter_deals': {},      # chapter -> {abbrev: [(suit, num, pips), ...]}
         'deal_order': [],         # color list from PlayOrderAction
         'chapter_court_cards': {}, # chapter -> [(suit, num, pips), ...] leftover/court
+        'ship_kills': {p: 0 for p in plist},      # confirmed kills dealt by player
+        'ship_losses': {p: 0 for p in plist},     # confirmed own ships lost
+        'battles_initiated': {p: 0 for p in plist},
+        'battles_defended': {p: 0 for p in plist},
+        'raid_successes': {p: 0 for p in plist},
+        'raid_steals': [],        # list of (chapter, attacker, defender, card_name)
+        'ransacks': {p: 0 for p in plist},
+        'buildings_destroyed_dealt': {p: 0 for p in plist},  # starport/city hits dealt
+        'buildings_destroyed_taken': {p: 0 for p in plist},
     }
 
     # Some games (Leaders&Lores) emit no StartChapterAction for ch1 (it starts implicitly
@@ -205,6 +214,7 @@ def analyze_log(lines, players_map, scoring_data=None):
     cur_round = 0
     prev_line = ''
     seen_secure = set()
+    ship_hp = {}  # ship_id ("Blue/Ship/4") -> current HP; ships have 2 HP fresh
 
     for l in lines:
         # ── Play order (deal order) ──
@@ -310,6 +320,61 @@ def analyze_log(lines, players_map, scoring_data=None):
                 if p in s['buildings_total']:
                     s['buildings_total'][p][btype] += 1
                     s['buildings_by_chapter'][cur_chapter][p][btype] += 1
+
+        # ── Combat: ship HP lifecycle (ships have 2 HP fresh) ──
+        bsm = re.search(r'BuildShipAction\((\w+),', l)
+        if bsm:
+            sid_m = re.search(r'(\w+/Ship/\d+)', l)
+            if sid_m:
+                ship_hp[sid_m.group(1)] = 2
+        rpm = re.match(r'RepairAction\((\w+),.*?,\s*(\w+/Ship/\d+),', l)
+        if rpm:
+            ship_hp[rpm.group(2)] = 2
+        dhm = re.match(r'DealHitsAction\((\w+),\s*(\w+),\s*\w+,\s*\[([^\]]*)\]', l)
+        if dhm:
+            dealer, victim = fa(dhm.group(1)), fa(dhm.group(2))
+            ship_targets = re.findall(r'(\w+/Ship/\d+)', dhm.group(3))
+            for sid in ship_targets:
+                cur = ship_hp.get(sid, 2)
+                cur -= 1
+                ship_hp[sid] = cur
+                if cur <= 0 and cur != -999:
+                    ship_hp[sid] = -999
+                    if dealer in s['ship_kills']:
+                        s['ship_kills'][dealer] += 1
+                    owner = fa(sid.split('/')[0])
+                    if owner in s['ship_losses']:
+                        s['ship_losses'][owner] += 1
+            n_sp = len(re.findall(r'/Starport/\d+', dhm.group(3)))
+            n_city = len(re.findall(r'/City/\d+', dhm.group(3)))
+            if n_sp or n_city:
+                if dealer in s['buildings_destroyed_dealt']:
+                    s['buildings_destroyed_dealt'][dealer] += n_sp + n_city
+                if victim in s['buildings_destroyed_taken']:
+                    s['buildings_destroyed_taken'][victim] += n_sp + n_city
+
+        # ── Combat: battles initiated / defended ──
+        bfm = re.match(r'BattleFactionAction\((\w+),.*?,\s*(\w+),\s*\[\],\s*(\w+),', l)
+        if bfm:
+            attacker, defender = fa(bfm.group(1)), fa(bfm.group(3))
+            if attacker in s['battles_initiated']:
+                s['battles_initiated'][attacker] += 1
+            if defender in s['battles_defended']:
+                s['battles_defended'][defender] += 1
+
+        # ── Combat: guild card raids ──
+        brcm = re.match(r'BattleRaidCourtCardAction\((\w+),\s*(\w+),\s*GuildCard\("[^"]+",\s*(\w+)\)', l)
+        if brcm:
+            attacker, defender, card = fa(brcm.group(1)), fa(brcm.group(2)), brcm.group(3)
+            if attacker in s['raid_successes']:
+                s['raid_successes'][attacker] += 1
+            s['raid_steals'].append((cur_chapter, attacker, defender, card))
+
+        rsm = re.match(r'RansackAction\((\w+),', l)
+        if rsm:
+            p = fa(rsm.group(1))
+            if p in s['ransacks']:
+                s['ransacks'][p] += 1
 
         # ── Resource economy ──
         # Gains: TaxGainAction(player, |(ResourceType), ...)
@@ -424,6 +489,8 @@ def analyze_log(lines, players_map, scoring_data=None):
         s[f'pip_high_{p}'] = sum(1 for x in pips if x >= 3)
         s[f'pip_low_{p}'] = sum(1 for x in pips if x <= 2)
         s[f'prelude_total_{p}'] = sum(s['prelude_pips'][p])
+        kills, losses = s['ship_kills'][p], s['ship_losses'][p]
+        s[f'kd_{p}'] = round(kills / losses, 2) if losses else (float(kills) if kills else 0.0)
 
    # ── Build scoring lookup from Playwright data ──
     # Scoring data has color names (Blue, Red, White, Yellow)
@@ -842,6 +909,54 @@ def generate_html(s, source_filename):
       </div>
     </div>''' if deal_luck_rows else ''
 
+    # Combat — kills, raids, battles initiated/defended
+    combat_rows = []
+    any_combat = any(s['battles_initiated'][p] or s['battles_defended'][p] for p in plist)
+    for p in plist:
+        px = player_hex(p)
+        kills, losses = s['ship_kills'][p], s['ship_losses'][p]
+        kd = s[f'kd_{p}']
+        kd_cls = 'deal-rich' if kd >= 1.5 else ('deal-poor' if kd < 0.8 else 'deal-mid')
+        combat_rows.append(
+            f'<tr><td style="color:{px};font-weight:700">{player_name(s,p)}</td>'
+            f'<td class="num">{s["battles_initiated"][p]}</td>'
+            f'<td class="num">{s["battles_defended"][p]}</td>'
+            f'<td class="num">{kills}</td>'
+            f'<td class="num">{losses}</td>'
+            f'<td class="num {kd_cls}">{kd}</td>'
+            f'<td class="num">{s["raid_successes"][p]}</td>'
+            f'<td class="num">{s["ransacks"][p]}</td>'
+            f'<td class="num">{s["buildings_destroyed_dealt"][p]}</td>'
+            f'<td class="num">{s["buildings_destroyed_taken"][p]}</td></tr>'
+        )
+
+    raid_steal_rows = []
+    for ch, attacker, defender, card in s['raid_steals']:
+        ax, dx = player_hex(attacker), player_hex(defender)
+        raid_steal_rows.append(
+            f'<div class="timeline-entry" style="border-left:3px solid {ax}">'
+            f'<span class="tl-chapter">Ch {ch}</span>'
+            f'<span class="tl-player" style="color:{ax}">{player_name(s,attacker)}</span>'
+            f'<span class="tl-results">raids <span style="color:{dx};font-weight:700">{player_name(s,defender)}</span> '
+            f'for <span style="font-weight:700">{card}</span></span></div>'
+        )
+
+    combat_html = f'''
+    <div class="card">
+      <h2>Combat</h2>
+      <p class="deal-legend">Ships have 2 HP — a kill requires two confirmed hits on the same ship. K/D ≥1.5 highlighted green, &lt;0.8 highlighted red.</p>
+      <div class="table-wrap">
+        <table class="deal-table">
+          <thead><tr><th>Player</th><th class="num">Battles init.</th><th class="num">Battles defended</th>
+            <th class="num">Kills</th><th class="num">Losses</th><th class="num">K/D</th>
+            <th class="num">Card raids won</th><th class="num">Ransacks</th>
+            <th class="num">Bldgs hit (dealt)</th><th class="num">Bldgs hit (taken)</th></tr></thead>
+          <tbody>{"".join(combat_rows)}</tbody>
+        </table>
+      </div>
+      {f'<div class="timeline" style="margin-top:16px">{"".join(raid_steal_rows)}</div>' if raid_steal_rows else ''}
+    </div>''' if any_combat else ''
+
     # Court cards detail per player
     court_detail_html = []
     for p in plist:
@@ -1249,6 +1364,9 @@ def generate_html(s, source_filename):
 
   <!-- ── DEAL LUCK ── -->
   {deal_luck_html}
+
+  <!-- ── COMBAT ── -->
+  {combat_html}
 
   <!-- ── COURT DETAIL ── -->
   <div class="card" style="margin-top:20px">
