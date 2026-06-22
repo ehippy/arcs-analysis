@@ -108,6 +108,106 @@ def extract_scoring_playwright(replay_path):
     return scores
 
 
+def extract_round_scoring_playwright(replay_path):
+    """Click through every LeadAction in the HRF replay log and read the live
+    'Current Scoring' projection panel at that point. Returns an ordered list
+    of (chapter, {color: vp}) tuples, one per LeadAction, in chronological order.
+    Scores only change at chapter boundaries (ambitions resolve at
+    ScoreChapterAction), so most entries repeat the prior value — expected, not a bug.
+
+    The chapter number for each entry is derived from the same full action-log
+    text used to find the click targets (counting 'Chapter N had ended'
+    markers before each 'led with' line), rather than cross-referencing against
+    a separately-computed line count — the raw replay log can contain extra
+    LeadAction lines from undone/replayed turns that never got their own
+    distinct entry in this rendered log, so position-based correlation across
+    two independent counts is unreliable."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    snapshots = []
+    try:
+        abs_path = str(Path(replay_path).resolve())
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={'width': 1600, 'height': 1000})
+            try:
+                page.goto(f'file://{abs_path}')
+                page.wait_for_load_state("domcontentloaded")
+                # Larger games take longer to auto-play through their full log —
+                # poll for "Game Over" instead of a fixed wait (mirrors extract_scoring_playwright).
+                for _ in range(80):
+                    page.wait_for_timeout(3000)
+                    if 'Game Over' in page.inner_text('body'):
+                        break
+
+                full_body = page.inner_text('body')
+                cur_ch = 1
+                lead_chapters = []
+                for fl in full_body.split('\n'):
+                    fl = fl.strip()
+                    if 'had ended' in fl and 'Chapter' in fl:
+                        cm = re.search(r'Chapter (\d+) had ended', fl)
+                        if cm:
+                            cur_ch = int(cm.group(1)) + 1
+                    elif 'led with' in fl:
+                        lead_chapters.append(cur_ch)
+
+                lead_action_nums = page.evaluate("""() => {
+                    const spans = Array.from(document.querySelectorAll('span[title^="Action #"]'));
+                    const seen = new Set();
+                    const out = [];
+                    for (const s of spans) {
+                        const t = s.innerText.trim();
+                        if (t.includes('led with')) {
+                            const num = parseInt(s.getAttribute('title').replace('Action #',''));
+                            if (!seen.has(num)) { seen.add(num); out.push(num); }
+                        }
+                    }
+                    out.sort((a,b) => a - b);
+                    return out;
+                }""")
+
+                if len(lead_action_nums) != len(lead_chapters):
+                    return []
+
+                for action_num, chapter in zip(lead_action_nums, lead_chapters):
+                    page.evaluate(f"""() => {{
+                        const spans = Array.from(document.querySelectorAll('span[title="Action #{action_num}"]'));
+                        const target = spans.find(s => s.innerText.includes('led with'));
+                        if (target) target.click();
+                    }}""")
+                    page.wait_for_timeout(200)
+                    body = page.inner_text('body')
+                    idx = body.find('Current Scoring')
+                    seg = body[idx:idx + 400] if idx >= 0 else ''
+                    # Each player's row looks like "Blue — ⟅0⟆ + ⟅3⟆ + ⟅3⟆ = ⟅6⟆" once
+                    # ambitions are in progress mid-chapter (0 = locked score from prior
+                    # chapters, the +N terms are live projected ambition payouts, the
+                    # final ⟅⟆ after "=" is the total). A player with no live ambition
+                    # contribution just shows a single "⟅N⟆" with no breakdown. Either
+                    # way, the LAST bracketed number in their row is the live total.
+                    positions = sorted(
+                        (m.start(), m.group()) for name in ('Blue', 'Red', 'White', 'Yellow')
+                        for m in re.finditer(re.escape(name), seg)
+                    )
+                    scores = {}
+                    for i, (pos, name) in enumerate(positions):
+                        end = positions[i + 1][0] if i + 1 < len(positions) else len(seg)
+                        nums = re.findall(r'⟅\s*(\d+)\s*⟆', seg[pos:end])
+                        if nums:
+                            scores[name] = int(nums[-1])
+                    if scores:
+                        snapshots.append((chapter, scores))
+            finally:
+                browser.close()
+    except Exception:
+        return []
+    return snapshots
+
+
 def parse_scoring_lines(chapter_scores):
     """Parse chapter-scoring tuples into structured data."""
     results = []
@@ -661,6 +761,37 @@ def generate_html(s, source_filename):
             'tension': 0.3,
             'fill': False,
         })
+
+    # Round-by-round scoring — live "Current Scoring" projection at each LeadAction.
+    # Each entry is (chapter, {color: vp}), already aligned 1:1 with its click target —
+    # no cross-referencing against a separately-computed line count needed.
+    round_scoring = s.get('round_scoring', [])
+    round_hand_labels = []
+    round_chapter_markers = []  # [{index, chapter}] where a new chapter starts
+    round_score_datasets = []
+    if round_scoring:
+        round_hand_labels = [str(i + 1) for i in range(len(round_scoring))] + ['Final']
+        prev_ch = None
+        for i, (ch, _) in enumerate(round_scoring):
+            if ch != prev_ch:
+                round_chapter_markers.append({'index': i, 'chapter': ch})
+                prev_ch = ch
+        for i, p in enumerate(plist):
+            full_name = next((k for k, v in FULL_TO_ABBREV.items() if v == p), p)
+            data = [snap.get(full_name, snap.get(p, None)) for _, snap in round_scoring]
+            # The live panel can't capture the final chapter's payout — that resolves
+            # after the last LeadAction, once the game ends — so append the true final score.
+            data.append(s['final_scores'].get(p, data[-1] if data else 0))
+            round_score_datasets.append({
+                'label': player_name(s, p),
+                'data': data,
+                'borderColor': phexes[i],
+                'backgroundColor': phexes[i] + '33',
+                'tension': 0,
+                'stepped': True,
+                'fill': False,
+                'pointRadius': 2,
+            })
 
     # Buildings total — grouped bar
     btypes = ['City', 'Starport', 'Ship']
@@ -1241,6 +1372,17 @@ def generate_html(s, source_filename):
 
   </div>
 
+  {f'''<div class="card" style="margin-top:20px">
+    <h2>Round-by-Round Scoring</h2>
+    <p style="color:var(--muted);font-size:0.82rem;margin:0 0 10px">
+      Live "Current Scoring" projection at each Lead action, in order. Scores only change when a
+      chapter resolves — dashed lines mark where each new chapter starts.
+    </p>
+    <div class="chart-wrap tall">
+      <canvas id="chartRoundScoring"></canvas>
+    </div>
+  </div>''' if round_score_datasets else ''}
+
   <!-- ── ACTION TYPES ── -->
   <div class="section-label">Action Types & Activities</div>
 
@@ -1406,6 +1548,44 @@ new Chart(document.getElementById('chartPipLine'), {{
   }},
 }});
 
+{f'''// ── Round-by-round scoring with chapter-boundary markers ──
+const chapterMarkerPlugin = {{
+  id: 'chapterMarker',
+  afterDraw(chart) {{
+    const {{ctx, chartArea: {{top, bottom}}, scales: {{x}}}} = chart;
+    const markers = {jc(round_chapter_markers)};
+    ctx.save();
+    markers.forEach(m => {{
+      const xPos = x.getPixelForValue(m.index);
+      ctx.strokeStyle = '#F0C040';
+      ctx.setLineDash([4, 4]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(xPos, top);
+      ctx.lineTo(xPos, bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#F0C040';
+      ctx.font = '11px sans-serif';
+      ctx.fillText('Ch ' + m.chapter, xPos + 4, top + 12);
+    }});
+    ctx.restore();
+  }},
+}};
+new Chart(document.getElementById('chartRoundScoring'), {{
+  type: 'line',
+  data: {{ labels: {jc(round_hand_labels)}, datasets: {jc(round_score_datasets)} }},
+  options: {{
+    responsive: true, maintainAspectRatio: true,
+    plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12, padding: 10 }} }} }},
+    scales: {{
+      x: {{ title: {{ display: true, text: 'Lead action #' }}, grid: {{ display: false }} }},
+      y: {{ title: {{ display: true, text: 'Projected VP' }}, grid: {{ color: '#334155' }}, beginAtZero: true }},
+    }},
+  }},
+  plugins: [chapterMarkerPlugin],
+}});''' if round_score_datasets else ''}
+
 // ── Combined grouped-stacked actions per chapter ──
 // Plugin draws one border rect around each complete player stack
 const stackBorderPlugin = {{
@@ -1542,7 +1722,12 @@ def main():
     print(f"  Found {len(scoring_lines)} scoring lines")
     scoring_data = parse_scoring_lines(scoring_lines)
 
+    print("Extracting round-by-round scoring via Playwright...")
+    round_scoring = extract_round_scoring_playwright(str(src))
+    print(f"  Found {len(round_scoring)} round scoring snapshots")
+
     stats = analyze_log(lines, players_map, scoring_data=scoring_data)
+    stats['round_scoring'] = round_scoring
     # Build scoring lookup for HTML generation
     scoring_lookup = {}
     for sd in scoring_data:
