@@ -230,6 +230,26 @@ def parse_scoring_lines(chapter_scores):
 def fa(color_str):
     return FULL_TO_ABBREV.get(color_str, color_str[0].upper() if color_str else '?')
 
+def split_top_level(s):
+    """Split a comma-separated argument string on top-level commas only,
+    respecting nested [...] brackets. Used to pull positional arguments
+    out of action lines whose inner arrays (e.g. dice rolls) contain commas."""
+    parts, depth, cur = [], 0, ''
+    for ch in s:
+        if ch == '[':
+            depth += 1
+            cur += ch
+        elif ch == ']':
+            depth -= 1
+            cur += ch
+        elif ch == ',' and depth == 0:
+            parts.append(cur.strip())
+            cur = ''
+        else:
+            cur += ch
+    parts.append(cur.strip())
+    return parts
+
 def parse_lobby(content):
     m = re.search(r'id="lobby"[^>]*>(.*?)</div>', content, re.DOTALL)
     if not m:
@@ -302,6 +322,8 @@ def analyze_log(lines, players_map, scoring_data=None):
         'ransacks': {p: 0 for p in plist},
         'buildings_destroyed_dealt': {p: 0 for p in plist},  # starport/city hits dealt
         'buildings_destroyed_taken': {p: 0 for p in plist},
+        'dice_collected': {p: defaultdict(int) for p in plist},  # {Skirmish/Assault/Raid: count}
+        'dice_symbols': {p: defaultdict(int) for p in plist},    # {HitShip/HitBuilding/RaidKey/OwnDamage/Intercept/Blank: count}
     }
 
     # Some games (Leaders&Lores) emit no StartChapterAction for ch1 (it starts implicitly
@@ -475,6 +497,29 @@ def analyze_log(lines, players_map, scoring_data=None):
             p = fa(rsm.group(1))
             if p in s['ransacks']:
                 s['ransacks'][p] += 1
+
+        # ── Combat: dice rolls ──
+        # BattleRolledAction(Attacker, System, [], Defender, [], [], [],
+        #                     [skirmish dice], [assault dice], [raid dice], [], MainTurnAction(...))
+        # Skirmish dice never self-damage (safe); Assault dice usually pair OwnDamage with
+        # HitShip (fast but costly); Raid dice carry HitBuilding/RaidKey (steal, risky).
+        if l.startswith('BattleRolledAction('):
+            am = re.match(r'BattleRolledAction\((\w+),(.*)\)$', l)
+            if am:
+                attacker = fa(am.group(1))
+                if attacker in s['dice_collected']:
+                    args = split_top_level(am.group(2))
+                    if len(args) >= 9:
+                        for die_type, arg in zip(('Skirmish', 'Assault', 'Raid'), args[6:9]):
+                            inner = arg[1:-1].strip() if arg.startswith('[') and arg.endswith(']') else ''
+                            dice = re.findall(r'\[([^\[\]]*)\]', inner) if inner else []
+                            s['dice_collected'][attacker][die_type] += len(dice)
+                            for die in dice:
+                                syms = [sy.strip() for sy in die.split(',') if sy.strip()]
+                                if not syms:
+                                    s['dice_symbols'][attacker]['Blank'] += 1
+                                for sym in syms:
+                                    s['dice_symbols'][attacker][sym] += 1
 
         # ── Resource economy ──
         # Gains: TaxGainAction(player, |(ResourceType), ...)
@@ -1050,6 +1095,44 @@ def generate_html(s, source_filename):
       {f'<div class="timeline" style="margin-top:16px">{"".join(raid_steal_rows)}</div>' if raid_steal_rows else ''}
     </div>''' if any_combat else ''
 
+    # Dice — collected by type, and what they actually rolled
+    DICE_SYMBOLS = ['HitShip', 'HitBuilding', 'RaidKey', 'OwnDamage', 'Intercept', 'Blank']
+    any_dice = any(sum(s['dice_collected'][p].values()) for p in plist)
+    dice_rows = []
+    for p in plist:
+        px = player_hex(p)
+        collected = s['dice_collected'][p]
+        total_dice = sum(collected.values())
+        syms = s['dice_symbols'][p]
+        sym_cells = ''.join(f'<td class="num">{syms.get(sy, 0)}</td>' for sy in DICE_SYMBOLS)
+        self_dmg_rate = round(100 * syms.get('OwnDamage', 0) / total_dice, 0) if total_dice else 0
+        dice_rows.append(
+            f'<tr><td style="color:{px};font-weight:700">{player_name(s,p)}</td>'
+            f'<td class="num">{collected.get("Skirmish", 0)}</td>'
+            f'<td class="num">{collected.get("Assault", 0)}</td>'
+            f'<td class="num">{collected.get("Raid", 0)}</td>'
+            f'<td class="num" style="font-weight:800">{total_dice}</td>'
+            f'{sym_cells}'
+            f'<td class="num">{self_dmg_rate}%</td></tr>'
+        )
+
+    dice_html = f'''
+    <div class="card">
+      <h2>Dice</h2>
+      <p class="deal-legend">Skirmish dice never self-damage (safe, slow). Assault dice often pair
+        OwnDamage with HitShip (fast, costly). Raid dice carry HitBuilding/RaidKey (steal, risky).</p>
+      <div class="table-wrap">
+        <table class="deal-table">
+          <thead><tr><th>Player</th><th class="num">Skirmish</th><th class="num">Assault</th><th class="num">Raid</th>
+            <th class="num">Total dice</th>
+            <th class="num">HitShip</th><th class="num">HitBuilding</th><th class="num">RaidKey</th>
+            <th class="num">OwnDamage</th><th class="num">Intercept</th><th class="num">Blank</th>
+            <th class="num">Self-dmg rate</th></tr></thead>
+          <tbody>{"".join(dice_rows)}</tbody>
+        </table>
+      </div>
+    </div>''' if any_dice else ''
+
     # Court cards detail per player
     court_detail_html = []
     for p in plist:
@@ -1430,6 +1513,9 @@ def generate_html(s, source_filename):
 
   <!-- ── COMBAT ── -->
   {combat_html}
+
+  <!-- ── DICE ── -->
+  {dice_html}
 
   <!-- ── COURT DETAIL ── -->
   <div class="card" style="margin-top:20px">
